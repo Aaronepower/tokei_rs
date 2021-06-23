@@ -9,7 +9,7 @@ use badge::{Badge, BadgeOptions};
 use cached::Cached;
 use once_cell::sync::Lazy;
 use tempfile::TempDir;
-use tokei::{Language, Languages};
+use tokei::{Language, LanguageType, Languages};
 
 const BILLION: usize = 1_000_000_000;
 const BLANKS: &str = "blank lines";
@@ -17,6 +17,7 @@ const BLUE: &str = "#007ec6";
 const CODE: &str = "lines of code";
 const COMMENTS: &str = "comments";
 const FILES: &str = "files";
+const PRIMARY_LANG: &str = "primary language";
 const HASH_LENGTH: usize = 40;
 const LINES: &str = "total lines";
 const MILLION: usize = 1_000_000;
@@ -35,7 +36,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(actix_web::middleware::Logger::default())
             .service(redirect_index)
-            .service(create_badge)
+            .service(create_stats_badge)
+            .service(create_primary_lang_badge)
     })
     .bind("0.0.0.0:8000")?
     .run()
@@ -82,7 +84,7 @@ struct BadgeQuery {
 }
 
 #[get("/b1/{domain}/{user}/{repo}")]
-async fn create_badge(
+async fn create_stats_badge(
     request: HttpRequest,
     web::Path((domain, user, repo)): web::Path<(String, String, String)>,
     web::Query(query): web::Query<BadgeQuery>,
@@ -125,7 +127,7 @@ async fn create_badge(
         };
 
         if found_match {
-            CACHE
+            STATS_CACHE
                 .lock()
                 .unwrap()
                 .cache_get(&repo_identifier(&url, &sha));
@@ -152,7 +154,7 @@ async fn create_badge(
         blanks = stats.blanks
     );
 
-    let badge = make_badge(&content_type, &stats, &category)?;
+    let badge = make_stats_badge(&content_type, &stats, &category)?;
 
     Ok(respond!(Ok, content_type, badge, sha))
 }
@@ -162,7 +164,7 @@ fn repo_identifier(url: &str, sha: &str) -> String {
 }
 
 #[cached::proc_macro::cached(
-    name = "CACHE",
+    name = "STATS_CACHE",
     result = true,
     with_cached_flag = true,
     type = "cached::TimedSizedCache<String, cached::Return<Language>>",
@@ -190,15 +192,109 @@ fn get_statistics(url: &str, _sha: &str) -> eyre::Result<cached::Return<Language
     for stat in &mut stats.stats {
         stat.name = stat.name.strip_prefix(temp_path)?.to_owned();
     }
-
     Ok(cached::Return::new(stats))
+}
+
+#[cached::proc_macro::cached(
+    name = "PRIMARY_LANG_CACHE",
+    result = true,
+    with_cached_flag = true,
+    type = "cached::TimedSizedCache<String, cached::Return<LanguageType>>",
+    create = "{ cached::TimedSizedCache::with_size_and_lifespan(1000, DAY_IN_SECONDS) }",
+    convert = r#"{ repo_identifier(url, _sha) }"#
+)]
+fn get_primary_lang(url: &str, _sha: &str) -> eyre::Result<cached::Return<LanguageType>> {
+    log::info!("{} - Cloning", url);
+    let temp_dir = TempDir::new()?;
+    let temp_path = temp_dir.path().to_str().unwrap();
+
+    Command::new("git")
+        .args(&["clone", &url, &temp_path, "--depth", "1"])
+        .output()?;
+
+    let mut languages = Languages::new();
+    log::info!("{} - Getting Statistics", url);
+    languages.get_statistics(&[temp_path], &[], &tokei::Config::default());
+
+    let (primary_language_type, _) = languages
+        .iter()
+        .max_by_key(|(_, lang)| lang.code)
+        .expect("No primary language");
+
+    Ok(cached::Return::new(*primary_language_type))
 }
 
 fn trim_and_float(num: usize, trim: usize) -> f64 {
     (num as f64) / (trim as f64)
 }
 
-fn make_badge(
+#[get("/b2/{domain}/{user}/{repo}")]
+async fn create_primary_lang_badge(
+    request: HttpRequest,
+    web::Path((domain, user, repo)): web::Path<(String, String, String)>,
+) -> actix_web::Result<HttpResponse> {
+    let content_type = match Accept::parse(&request) {
+        Ok(accept) if accept == Accept::json() => ContentType::json(),
+        _ => CONTENT_TYPE_SVG.clone()
+    };
+
+    let mut domain = percent_encoding::percent_decode_str(&domain).decode_utf8()?;
+
+    // For backwards compatability if a domain isn't specified we append `.com`.
+    if !domain.contains(".") {
+        domain += ".com";
+    }
+
+    let url = format!("https://{}/{}/{}", domain, user, repo);
+    let ls_remote = Command::new("git").arg("ls-remote").arg(&url).output()?;
+    let sha: String = ls_remote
+        .stdout
+        .iter()
+        .position(|&b| b == b'\t')
+        .filter(|i| *i == HASH_LENGTH)
+        .map(|i| (&ls_remote.stdout[..i]).to_owned())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| actix_web::error::ErrorBadRequest(eyre::eyre!("Invalid SHA provided.")))?;
+
+    if let Ok(if_none_match) = IfNoneMatch::parse(&request) {
+        let sha_tag = EntityTag::new(false, sha.clone());
+        let found_match = match if_none_match {
+            IfNoneMatch::Any => false,
+            IfNoneMatch::Items(items) => items.iter().any(|etag| etag.weak_eq(&sha_tag)),
+        };
+
+        if found_match {
+            PRIMARY_LANG_CACHE
+                .lock()
+                .unwrap()
+                .cache_get(&repo_identifier(&url, &sha));
+            log::info!("{}#{} Not Modified", url, sha);
+            return Ok(respond!(NotModified));
+        }
+    }
+
+    let entry = get_primary_lang(&url, &sha).map_err(|err| actix_web::error::ErrorBadRequest(err))?;
+
+    if entry.was_cached {
+        log::info!("{}#{} Cache hit", url, sha);
+    }
+
+    let primary_language_type = entry.value;
+
+    log::info!(
+        "{url}#{sha} - Primary Language {lang}",
+        url = url,
+        sha = sha,
+        lang = primary_language_type,
+    );
+
+    let badge = make_primary_lang_badge(&content_type, &primary_language_type)?;
+
+    Ok(respond!(Ok, content_type, badge, sha))
+
+}
+
+fn make_stats_badge(
     content_type: &ContentType,
     stats: &Language,
     category: &str,
@@ -228,6 +324,20 @@ fn make_badge(
     let options = BadgeOptions {
         subject: String::from(label),
         status: amount,
+        color: String::from(BLUE),
+    };
+
+    Ok(Badge::new(options).unwrap().to_svg())
+}
+
+fn make_primary_lang_badge(content_type: &ContentType, lang: &LanguageType) -> actix_web::Result<String> {
+    if *content_type == ContentType::json() {
+        return Ok(serde_json::to_string(&lang)?);
+    }
+
+    let options = BadgeOptions {
+        subject: String::from(PRIMARY_LANG),
+        status: lang.to_string(),
         color: String::from(BLUE),
     };
 
